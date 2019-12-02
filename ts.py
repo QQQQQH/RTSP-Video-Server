@@ -1,6 +1,7 @@
 MAX_TRANSMISSION_UNIT = 1500
 TS_PACKET_SIZE = 188
 TS_PACKET_NUM = 7
+TS_PAYLOAD_SIZE = TS_PACKET_NUM * TS_PACKET_SIZE
 
 
 def _get_pcr(tsPacket):
@@ -22,31 +23,14 @@ def _get_pcr(tsPacket):
     all = vRef * 300 + vExt
     return all // 27000
 
-
-def unit_start(tsPacket):
-    return tsPacket[1] & 64
-
-
 def get_ts_payload(f):
-    finished = False
     while True:
-        if finished:
+        payload = f.read(TS_PAYLOAD_SIZE)
+        if not payload:
+            print('Finished')
             break
-        payload = bytes()
-        unitStart = False
-        for i in range(TS_PACKET_NUM):
-            tsPacket = f.read(TS_PACKET_SIZE)
-            if not tsPacket:
-                finished = True
-                print('Finished reading .ts file')
-                break
-            if unit_start(tsPacket):
-                if i == 0:
-                    unitStart = True
-                else:
-                    f.seek(-len(tsPacket), 1)
-                    break
-            if tsPacket[0] != 0x47:
-                print('Package dose not start with 0x47')
-            payload += tsPacket
-        yield payload, unitStart
+        length = len(payload)
+        for i in range(length // 188):
+            if payload[i * TS_PACKET_SIZE] != 0x47:
+                print('Packet does not begin with 0x47')
+        yield payload

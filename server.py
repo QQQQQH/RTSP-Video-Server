@@ -15,7 +15,8 @@ class Server:
     RTSP_PORT = 8554
     RTP_PORT = 55532
     RTCP_PORT = 55533
-    MAX_BUF = 1024 * 1024
+    MAX_BUF = 1024
+    MAX_SEQNUM = 65535
     H264_FILE_NAME = 'test/1.h264'
     TS_FILE_NAME = 'test/1.ts'
     RTP_VERSION = 2
@@ -97,13 +98,14 @@ class Server:
 
     def recv_request(self):
         # parse request
-        request = self.serverRtspSocket.recv(self.MAX_BUF)
-        if not request:
+        try:
+            request = self.serverRtspSocket.recv(self.MAX_BUF)
+            if not request:
+                return
+        except:
             return
-        print('Receving')
         print(request)
         request = request.decode('utf-8')
-        print(request)
         requestLines = request.split('\r\n')
         requestDic = rtsp.parse_request(requestLines)
         [method, url, version] = requestLines[0].strip().split(' ')
@@ -119,11 +121,8 @@ class Server:
             response = self.handle_PLAY(requestDic)
         else:
             return
-        print('Sending response')
-        print(response)
         response = response.encode('utf-8')
         print(response)
-        print('\n---------------------\n')
         self.serverRtspSocket.send(response)
         if method == 'PLAY':
             self.send_ts()
@@ -153,14 +152,15 @@ class Server:
     def send_ts(self):
         rtpPacket = RtpPacket(self.RTP_VERSION, 0, 0, 0, 0, self.RTP_PAYLOAD_TYPE_TS, 0, 0, 0x88923423)
         with open(self.TS_FILE_NAME, 'rb') as f:
-            for rtpPayload, unitStart in ts.get_ts_payload(f):
+            for rtpPayload in ts.get_ts_payload(f):
                 rtpPacket.set_payload(rtpPayload)
                 self.serverRtpSocket.sendto(rtpPacket.get_packet(), (self.LOCAL_HOST, self.clientRtpPort))
-                rtpPacket.seqNum += 1
-                # if unitStart:
-                #     rtpPacket.timeStamp += 90000 // 30
-                # print(rtpPacket.timeStamp)
-                # time.sleep(1.0 / 1000)
+                if rtpPacket.seqNum == self.MAX_SEQNUM:
+                    rtpPacket.seqNum = 0
+                else:
+                    rtpPacket.seqNum += 1
+                print(rtpPacket.seqNum)
+                time.sleep(0.001)
 
     def work(self):
         while True:
