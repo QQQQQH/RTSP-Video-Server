@@ -4,48 +4,83 @@ import re
 import random
 import rtsp
 import ts
+import threading
 from rtpPacket import RtpPacket
-from h264 import get_H264_frame
-from h264 import send_H264_frame
+
+
+def close_socket(sock):
+    if sock:
+        sock.shutdown(socket.SHUT_RDWR)
+        sock.close()
+        sock = None
 
 
 class Server:
     HOST = ''
     LOCAL_HOST = '127.0.0.1'
-    RTSP_PORT = 8554
-    RTP_PORT = 55532
-    RTCP_PORT = 55533
+    SERVER_LISTEN_PORT = 8554
+
     MAX_BUF = 1024
     MAX_SEQNUM = 65535
-    H264_FILE_NAME = 'test/1.h264'
-    TS_FILE_NAME = 'test/1.ts'
+
+    MOVIE_FILE_NAME = 'test/2.ts'
+
     RTP_VERSION = 2
-    RTP_PAYLOAD_TYPE_H264 = 96
     RTP_PAYLOAD_TYPE_TS = 33
-    H264_READ_LEN = 500000
 
     def __init__(self):
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.serverRtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.serverRtcpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.listenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+
+        self.serverRtpSocket = None
         self.serverRtspSocket = None
+
         self.clientRtpPort = None
         self.clientRtcpPort = None
-        self.set_scoket()
 
-    def set_scoket(self):
-        # set socket
-        self.serverRtpSocket.bind((self.HOST, self.RTP_PORT))
-        self.serverRtcpSocket.bind((self.HOST, self.RTCP_PORT))
+        self.work()
 
-        self.socket.bind((self.HOST, self.RTSP_PORT))
-        self.socket.listen(10)
-        print('Accepting')
-        accepted = self.socket.accept()
-        self.serverRtspSocket = accepted[0]
-        print('Accepted: ')
-        print(accepted[1])
-        print('\n')
+    def reset_server(self):
+        close_socket(self.serverRtpSocket)
+        close_socket(self.serverRtspSocket)
+
+        self.clientRtpPort = None
+        self.clientRtcpPort = None
+
+    def bind_socket(self):
+        try:
+            self.listenSocket.bind((self.HOST, self.SERVER_LISTEN_PORT))
+        except Exception as e:
+            print('bind server listen socket error: ')
+            print(e)
+        finally:
+            print('listen started at: ' + self.HOST + str(self.SERVER_LISTEN_PORT))
+
+    def work(self):
+        self.bind_socket()
+        self.listenSocket.listen(10)
+        while True:
+            print('Accepting')
+            accepted = self.listenSocket.accept()
+            self.serverRtspSocket = accepted[0]
+            print('Accepted: ')
+            print(accepted[1])
+            self.recv_request()
+
+    def recv_request(self):
+        while True:
+            try:
+                request = self.serverRtspSocket.recv(self.MAX_BUF)
+            except Exception as e:
+                print('server rtsp socket closed')
+                print(e)
+                break
+            else:
+                if not request:
+                    print('client rtsp socket closed')
+                    self.reset_server()
+                    break
+                self.parse_request(request)
 
     def handle_OPTIONS(self, requestDic):
         responseDic = {
@@ -72,7 +107,7 @@ class Server:
             'Content-length': len(sdp),
             'Session': requestDic['Session']
         }
-        response = rtsp.generate_response(responseDic, append=sdp)
+        response = rtsp.generate_response(responseDic, sdp)
         return response
 
     def handle_SETUP(self, requestDic):
@@ -81,7 +116,8 @@ class Server:
         self.clientRtpPort, self.clientRtcpPort = int(res.group(1)), int(res.group(2))
         responseDic = {
             'CSeq': requestDic['CSeq'],
-            'Transport': requestDic['Transport'] + ';server_port=%d-%d' % (self.RTP_PORT, self.RTCP_PORT),
+            # 'Transport': requestDic['Transport'] + ';server_port=%d-%d' % (self.SERVER_RTP_PORT, self.SERVER_RTCP_PORT),
+            'Transport': requestDic['Transport'],
             'Session': requestDic['Session']
         }
         response = rtsp.generate_response(responseDic)
@@ -96,14 +132,7 @@ class Server:
         response = rtsp.generate_response(responseDic)
         return response
 
-    def recv_request(self):
-        # parse request
-        try:
-            request = self.serverRtspSocket.recv(self.MAX_BUF)
-            if not request:
-                return
-        except:
-            return
+    def parse_request(self, request):
         print(request)
         request = request.decode('utf-8')
         requestLines = request.split('\r\n')
@@ -125,43 +154,25 @@ class Server:
         print(response)
         self.serverRtspSocket.send(response)
         if method == 'PLAY':
-            self.send_ts()
+            threading.Thread(target=self.send_movie).start()
 
-        return
-
-    def send_h264(self):
-        rtpPacket = RtpPacket(self.RTP_VERSION, 0, 0, 0, 0, self.RTP_PAYLOAD_TYPE_H264, 0, 0, 0x88923423)
-        with open(self.H264_FILE_NAME, 'rb') as f:
-            while True:
-                frame = get_H264_frame(f, self.H264_READ_LEN)
-                if not frame:
-                    return False
-                if frame[2] == 1:
-                    startCode = 3
-                else:
-                    startCode = 4
-                frameSize = len(frame) - startCode
-                sentBytes = send_H264_frame(self.serverRtpSocket,
-                                            (self.LOCAL_HOST, self.clientRtpPort),
-                                            rtpPacket,
-                                            frame[startCode:],
-                                            frameSize)
-                rtpPacket.timeStamp += 90000 // 25
-                time.sleep(1.0 / 25)
-
-    def send_ts(self):
-        rtpPacket = RtpPacket(self.RTP_VERSION, 0, 0, 0, 0, self.RTP_PAYLOAD_TYPE_TS, 0, 0, 0x88923423)
-        with open(self.TS_FILE_NAME, 'rb') as f:
+    def send_movie(self):
+        self.serverRtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.serverRtpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+        rtpPacket = RtpPacket()
+        with open(self.MOVIE_FILE_NAME, 'rb') as f:
             for rtpPayload in ts.get_ts_payload(f):
                 rtpPacket.set_payload(rtpPayload)
-                self.serverRtpSocket.sendto(rtpPacket.get_packet(), (self.LOCAL_HOST, self.clientRtpPort))
-                if rtpPacket.seqNum == self.MAX_SEQNUM:
-                    rtpPacket.seqNum = 0
+                try:
+                    self.serverRtpSocket.sendto(rtpPacket.get_packet(), (self.LOCAL_HOST, self.clientRtpPort))
+                except Exception as e:
+                    print('server rtp socket closed')
+                    print(e)
+                    break
                 else:
-                    rtpPacket.seqNum += 1
-                print(rtpPacket.seqNum)
-                time.sleep(0.001)
-
-    def work(self):
-        while True:
-            self.recv_request()
+                    if rtpPacket.seqNum == self.MAX_SEQNUM:
+                        rtpPacket.seqNum = 0
+                    else:
+                        rtpPacket.seqNum += 1
+                    print(rtpPacket.seqNum)
+                    time.sleep(0.001)

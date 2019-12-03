@@ -23,11 +23,12 @@ def _get_pcr(tsPacket):
     all = vRef * 300 + vExt
     return all // 27000
 
+
 def get_ts_payload(f):
     while True:
         payload = f.read(TS_PAYLOAD_SIZE)
         if not payload:
-            print('Finished')
+            print('Finished reading the file.')
             break
         length = len(payload)
         for i in range(length // 188):
