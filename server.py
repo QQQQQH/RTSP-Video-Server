@@ -6,13 +6,8 @@ import rtsp
 import ts
 import os
 import threading
+from client import Client, close_socket
 from rtpPacket import RtpPacket
-
-
-def close_socket(sock):
-    if sock:
-        sock.shutdown(socket.SHUT_RDWR)
-        sock.close()
 
 
 class Server:
@@ -32,6 +27,8 @@ class Server:
         self.listenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
 
+        self.clientList = []
+
         self.serverRtpSocket = None
         self.serverRtspSocket = None
 
@@ -43,16 +40,6 @@ class Server:
         self.continueEvent.set()
 
         self.work()
-
-    def reset_server(self):
-        close_socket(self.serverRtpSocket)
-        close_socket(self.serverRtspSocket)
-
-        self.clientRtpPort = None
-        self.clientRtcpPort = None
-
-        self.moviePath = None
-        self.continueEvent.set()
 
     def bind_socket(self):
         try:
@@ -69,15 +56,17 @@ class Server:
         while True:
             print('Accepting')
             accepted = self.listenSocket.accept()
-            self.serverRtspSocket = accepted[0]
+            clt = Client()
+            clt.serverRtspSocket = accepted[0]
+            self.clientList.append(clt)
             print('Accepted: ')
             print(accepted[1])
-            self.recv_request()
+            threading.Thread(target=self.recv_request, args=(clt,)).start()
 
-    def recv_request(self):
+    def recv_request(self, clt):
         while True:
             try:
-                request = self.serverRtspSocket.recv(self.MAX_BUF)
+                request = clt.serverRtspSocket.recv(self.MAX_BUF)
             except Exception as e:
                 print('server rtsp socket closed')
                 print(e)
@@ -85,34 +74,34 @@ class Server:
             else:
                 if not request:
                     print('client rtsp socket closed')
-                    self.reset_server()
+                    clt.close()
                     break
-                self.parse_request(request)
+                self.parse_request(request, clt)
 
-    def send_response(self, response):
+    def send_response(self, response, clt):
         response = response.encode('utf-8')
         print(response)
-        self.serverRtspSocket.send(response)
+        clt.serverRtspSocket.send(response)
 
-    def handle_OPTIONS(self, requestDic):
+    def handle_OPTIONS(self, requestDic, clt):
         pattern = r'rtsp://.*/(.*)'
         res = re.search(pattern, requestDic['url'])
-        self.moviePath = self.MOVIE_DIR_PATH + '/' + res.group(1)
-        fileName = str(os.path.splitext(self.moviePath)[0])
-        if os.path.isfile(self.moviePath):
+        clt.moviePath = self.MOVIE_DIR_PATH + '/' + res.group(1)
+        fileName = str(os.path.splitext(clt.moviePath)[0])
+        if os.path.isfile(clt.moviePath):
             if not os.path.isfile(fileName + '.ts'):
                 os.system('ffmpeg -y -i %s.mp4 -vcodec copy -acodec copy -vbsf h264_mp4toannexb %s.ts'
                           % (fileName, fileName))
-        self.moviePath = fileName + '.ts'
+        clt.moviePath = fileName + '.ts'
         responseDic = {
             'CSeq': requestDic['CSeq'],
             'Public': 'OPTIONS, DESCRIBE, SETUP, PLAY',
             'Session': ''.join(random.sample('0123456789', 8))
         }
         response = rtsp.generate_response(responseDic)
-        self.send_response(response)
+        self.send_response(response, clt)
 
-    def handle_DESCRIBE(self, requestDic):
+    def handle_DESCRIBE(self, requestDic, clt):
         sessionSdpDic = {
             'sessionId': str(int(time.time()))
         }
@@ -129,12 +118,12 @@ class Server:
             'Session': requestDic['Session']
         }
         response = rtsp.generate_response(responseDic, sdp)
-        self.send_response(response)
+        self.send_response(response, clt)
 
-    def handle_SETUP(self, requestDic):
+    def handle_SETUP(self, requestDic, clt):
         pattern = r'client_port=(\d*)-(\d*)'
         res = re.search(pattern, requestDic['Transport'])
-        self.clientRtpPort, self.clientRtcpPort = int(res.group(1)), int(res.group(2))
+        clt.clientRtpPort, clt.clientRtcpPort = int(res.group(1)), int(res.group(2))
         responseDic = {
             'CSeq': requestDic['CSeq'],
             # 'Transport': requestDic['Transport'] + ';server_port=%d-%d' % (self.SERVER_RTP_PORT, self.SERVER_RTCP_PORT),
@@ -142,9 +131,9 @@ class Server:
             'Session': requestDic['Session']
         }
         response = rtsp.generate_response(responseDic)
-        self.send_response(response)
+        self.send_response(response, clt)
 
-    def handle_PLAY(self, requestDic):
+    def handle_PLAY(self, requestDic, clt):
         pattern = r'npt=(\d*)-'
         res = re.search(pattern, requestDic['Range'])
         startTime = int(res.group(1))
@@ -154,13 +143,13 @@ class Server:
             'Session': requestDic['Session'] + ';timeout=60',
         }
         if startTime == 0:
-            if not self.continueEvent.is_set():
-                self.continueEvent.set()
+            if not clt.continueEvent.is_set():
+                clt.continueEvent.set()
             else:
-                length = os.path.getsize(self.moviePath)
+                length = os.path.getsize(clt.moviePath)
                 pos = length // ts.TS_PACKET_SIZE * ts.TS_PACKET_SIZE - ts.TS_PACKET_SIZE + 1
                 totalTime = 0
-                with open(self.moviePath, 'rb') as f:
+                with open(clt.moviePath, 'rb') as f:
                     if f.seek(pos, 0) > 0:
                         while True:
                             tsPacket = f.read(ts.TS_PACKET_SIZE)
@@ -171,13 +160,13 @@ class Server:
                                 break
                 responseDic['Range'] += str(int(totalTime))
             response = rtsp.generate_response(responseDic)
-            self.send_response(response)
-            threading.Thread(target=self.send_movie).start()
+            self.send_response(response, clt)
+            threading.Thread(target=self.send_movie, args=(clt,)).start()
         else:
-            close_socket(self.serverRtpSocket)
+            close_socket(clt.serverRtpSocket)
             startPos = 0
             preTime = 0
-            with open(self.moviePath, 'rb') as f:
+            with open(clt.moviePath, 'rb') as f:
                 while True:
                     tsPacket = f.read(ts.TS_PACKET_SIZE)
                     if not tsPacket:
@@ -191,28 +180,28 @@ class Server:
                     preTime = getTime
             responseDic['Range'] = 'npt=' + str(int(getTime)) + '-'
             response = rtsp.generate_response(responseDic)
-            self.send_response(response)
-            threading.Thread(target=self.send_movie, args=(startPos,)).start()
+            self.send_response(response, clt)
+            threading.Thread(target=self.send_movie, args=(clt, startPos)).start()
 
-    def handle_PAUSE(self, requestDic):
-        self.continueEvent.clear()
+    def handle_PAUSE(self, requestDic, clt):
+        clt.continueEvent.clear()
         responseDic = {
             'CSeq': requestDic['CSeq'],
             'Session': requestDic['Session']
         }
         response = rtsp.generate_response(responseDic)
-        self.send_response(response)
+        self.send_response(response, clt)
 
-    def handle_TEARDOWN(self, requestDic):
+    def handle_TEARDOWN(self, requestDic, clt):
         responseDic = {
             'CSeq': requestDic['CSeq'],
             'Session': requestDic['Session']
         }
         response = rtsp.generate_response(responseDic)
-        self.send_response(response)
-        self.reset_server()
+        self.send_response(response, clt)
+        clt.close()
 
-    def parse_request(self, request):
+    def parse_request(self, request, clt):
         print(request)
         request = request.decode('utf-8')
         requestLines = request.split('\r\n')
@@ -221,32 +210,32 @@ class Server:
         requestDic['method'], requestDic['url'] = method, url
 
         if method == 'SETUP':
-            self.handle_SETUP(requestDic)
+            self.handle_SETUP(requestDic, clt)
         elif method == 'OPTIONS':
-            self.handle_OPTIONS(requestDic)
+            self.handle_OPTIONS(requestDic, clt)
         elif method == 'DESCRIBE':
-            self.handle_DESCRIBE(requestDic)
+            self.handle_DESCRIBE(requestDic, clt)
         elif method == 'PLAY':
-            self.handle_PLAY(requestDic)
+            self.handle_PLAY(requestDic, clt)
         elif method == 'PAUSE':
-            self.handle_PAUSE(requestDic)
+            self.handle_PAUSE(requestDic, clt)
         elif method == 'TEARDOWN':
-            self.handle_TEARDOWN(requestDic)
+            self.handle_TEARDOWN(requestDic, clt)
         else:
             return
 
-    def send_movie(self, startPos=0):
-        self.serverRtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.serverRtpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+    def send_movie(self, clt, startPos=0):
+        clt.serverRtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        clt.serverRtpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         rtpPacket = RtpPacket()
-        with open(self.moviePath, 'rb') as f:
+        with open(clt.moviePath, 'rb') as f:
             f.seek(startPos, 0)
             cnt = 0
             for rtpPayload in ts.get_ts_payload(f):
                 rtpPacket.set_payload(rtpPayload)
-                self.continueEvent.wait()
+                clt.continueEvent.wait()
                 try:
-                    self.serverRtpSocket.sendto(rtpPacket.get_packet(), (self.LOCAL_HOST, self.clientRtpPort))
+                    clt.serverRtpSocket.sendto(rtpPacket.get_packet(), (self.LOCAL_HOST, clt.clientRtpPort))
                 except Exception as e:
                     print('server rtp socket closed')
                     print(e)
