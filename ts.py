@@ -4,7 +4,7 @@ TS_PACKET_NUM = 7
 TS_PAYLOAD_SIZE = TS_PACKET_NUM * TS_PACKET_SIZE
 
 
-def _get_pcr(tsPacket):
+def get_ts_pcr(tsPacket):
     if len(tsPacket) < 188:
         return -1
     if not (tsPacket[3] & 32):
